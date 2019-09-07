@@ -19,9 +19,9 @@ open Hopac
 
 // markers for the successful completion of an associated async-processing-method route
 // if true, the request was not cancelled correctly (assuming the request was in fact cancelled by the client)
-type Model = 
-  { task: bool 
-    async: bool 
+type Model =
+  { task: bool
+    async: bool
     job: bool }
   with static member Empty = { task = false; async = false; job = false }
 
@@ -50,25 +50,38 @@ module Views =
     let partial =
         h1 [] [ encodedText "giraffe_cancellation_sample" ]
 
-    let statusTable (model: Model)= 
-        let jsGetUrl kind = 
-            sprintf """fetch("/%s/2")
+    let abortControllerScript =
+        script [] [
+            rawText """
+                window.controller = new AbortController();
+                window.abortSignal = window.controller.signal;
+            """
+        ]
+    let statusTable (model: Model)=
+        let jsGetUrl kind =
+            sprintf """fetch("/%s/5", { signal : window.abortSignal })
                         .then(response => window.location.reload())
                         .catch((err) => console.log(err))
                     """ kind
-        
+
+        let jsCancelRequestsAndReload =
+            """controller.abort();
+               window.location.reload();"""
+
         let row kind status = tr [] [
             td [] [str kind]
             td [] [str (string status)]
             td [] [ button [_onclick (jsGetUrl kind)  ] [ str (sprintf "start %s" kind )] ]
+            td [] [ button [_onclick jsCancelRequestsAndReload ] [ str "cancel" ] ]
         ]
-        
+
         table [] [
             thead [] [
                 tr [] [
                     th [] [ str "method"]
                     th [] [ str "state" ]
-                    th [] [ str "fire and cancel" ]
+                    th [] [ str "fire" ]
+                    th [] [ str "cancel" ]
                 ]
             ]
             tbody [] [
@@ -77,14 +90,15 @@ module Views =
                 row "job" model.job
             ]
         ]
-    
-    let resetButton = 
+
+    let resetButton =
         button [_onclick ("""fetch("/reset")
                                 .then(() => window.location.reload())
                                 .catch((err) => console.log(err))""") ] [str "Reset State"]
 
     let index model =
         layout [ partial
+                 abortControllerScript
                  statusTable model
                  resetButton ]
 
@@ -92,16 +106,16 @@ module Views =
 // Web app
 // ---------------------------------
 
-let reset () = 
+let reset () =
     state <- Model.Empty
 
-let logState (logger: ILogger) = 
+let logState (logger: ILogger) =
     logger.LogWarning(sprintf "State Flags:\n\tTask: %b\n\tAsync: %b\n\tJob: %b" state.task state.async state.job)
 
-let indexHandler = fun next (ctx: HttpContext) -> task { 
+let indexHandler = fun next (ctx: HttpContext) -> task {
     ctx.GetLogger().LogWarning("Rendering Index")
     logState (ctx.GetLogger())
-    return! htmlView (Views.index state) next ctx 
+    return! htmlView (Views.index state) next ctx
 }
 
 let taskHandler (seconds: int) = fun next (ctx: HttpContext) -> task {
@@ -111,16 +125,16 @@ let taskHandler (seconds: int) = fun next (ctx: HttpContext) -> task {
     return! setStatusCode 200 next ctx
 }
 
-let asyncHandler (seconds: int) = fun next (ctx: HttpContext) -> 
+let asyncHandler (seconds: int) = fun next (ctx: HttpContext) ->
     async {
         do! Async.Sleep (1000 * seconds)
         state <- { state with async = true }
         ctx.GetLogger().LogWarning("set async marker")
         return! Async.AwaitTask (setStatusCode 200 next ctx)
-    } 
+    }
     |> Async.StartAsTask
 
-let jobHandler (seconds: int) = fun next (ctx: HttpContext) -> 
+let jobHandler (seconds: int) = fun next (ctx: HttpContext) ->
     job {
         do! timeOut (TimeSpan.FromSeconds (float seconds))
         state <- { state with job = true }
