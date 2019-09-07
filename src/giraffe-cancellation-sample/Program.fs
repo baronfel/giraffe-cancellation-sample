@@ -10,8 +10,28 @@ open Microsoft.Extensions.Logging
 open Microsoft.Extensions.DependencyInjection
 open Giraffe
 open FSharp.Control.Tasks.V2.ContextInsensitive
+open System.Threading
 open System.Threading.Tasks
 open Hopac
+
+type Async =
+    static member WithCancellation(computation : Async<'T>, cancellationToken : CancellationToken) : Async<'T> = 
+        async {
+            let! ct2 = Async.CancellationToken
+            use cts = CancellationTokenSource.CreateLinkedTokenSource (cancellationToken, ct2)
+            let tcs = new TaskCompletionSource<'T>()
+            use _reg = cts.Token.Register (fun () -> tcs.TrySetCanceled() |> ignore)
+            let inner = 
+                async {
+                    try
+                      let! a = computation
+                      tcs.TrySetResult a |> ignore
+                    with ex ->
+                      tcs.TrySetException ex |> ignore 
+                }
+            Async.Start (inner, cts.Token)
+            return! Async.AwaitTask tcs.Task 
+        }
 
 // ---------------------------------
 // Models
@@ -120,8 +140,12 @@ let indexHandler = fun next (ctx: HttpContext) -> task {
 
 let taskHandler (seconds: int) = fun next (ctx: HttpContext) -> task {
     do! Task.Delay (TimeSpan.FromSeconds (float seconds))
-    state <- { state with task = true }
-    ctx.GetLogger().LogWarning("set task marker")
+    if not ctx.RequestAborted.IsCancellationRequested 
+    then
+        state <- { state with task = true }
+        ctx.GetLogger().LogWarning("set task marker")
+    else
+        ctx.GetLogger().LogWarning("Token cancelled, no work done")
     return! setStatusCode 200 next ctx
 }
 
@@ -132,17 +156,21 @@ let asyncHandler (seconds: int) = fun next (ctx: HttpContext) ->
         ctx.GetLogger().LogWarning("set async marker")
         return! Async.AwaitTask (setStatusCode 200 next ctx)
     }
-    |> Async.StartAsTask
+    |> fun a -> Async.StartAsTask(a, cancellationToken = ctx.RequestAborted)
 
 let jobHandler (seconds: int) = fun next (ctx: HttpContext) ->
     job {
         do! timeOut (TimeSpan.FromSeconds (float seconds))
-        state <- { state with job = true }
-        ctx.GetLogger().LogWarning("set job marker")
+        if not ctx.RequestAborted.IsCancellationRequested
+        then
+            state <- { state with job = true }
+            ctx.GetLogger().LogWarning("set job marker")
+        else
+            ctx.GetLogger().LogWarning("Token cancelled, skipping work")
         return! setStatusCode 200 next ctx
     }
     |> Job.toAsync
-    |> Async.StartAsTask
+    |> fun a -> Async.StartAsTask(a, cancellationToken = ctx.RequestAborted)
 
 let resetHandler = fun next (ctx: HttpContext) -> task {
     reset ()
@@ -150,6 +178,17 @@ let resetHandler = fun next (ctx: HttpContext) -> task {
     logState (ctx.GetLogger())
     return! next ctx
 }
+
+let asyncCancelHandler seconds: HttpHandler = fun next ctx -> 
+    //Async.WithCancellation(
+        async {
+            do! Async.Sleep (1000 * seconds)
+            state <- { state with async = true }
+            ctx.GetLogger().LogWarning("set async marker")
+            return! Async.AwaitTask (setStatusCode 200 next ctx)
+        } //, ctx.RequestAborted)
+        |> fun a -> Async.StartAsTask(a, cancellationToken = ctx.RequestAborted)
+
 
 let webApp =
     choose [
